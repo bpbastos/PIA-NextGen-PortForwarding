@@ -19,12 +19,17 @@ piapass='PIApassword'
 transuser='TransUser'
 transpass='TransPass'
 
+#qBitorrent Credentials
+qbituser='QBitUser'
+qbitpass='QBitPass'
+
 # OpenVPN interface name
 ovpniface='ovpnc1'
 
 # Alias names for Transmission IP and PORT. Not the real IP nor Port numbers!
 ipalias='Transmission_IP'
-portalias='Transmission_Port'
+qbitipalias='QBitTorrentIP'
+portalias='TorrentPort'
 
 ######################## MAIN #########################
 # Wait for VPN interface to get fully UP
@@ -38,44 +43,52 @@ tmpconffile='/tmp/tmpconfig.xml'
 # Fetch remote Transmission IP from config
 transip=$(xml sel -t -v "//alias[name=\"$ipalias\"]/address" $conffile)
 
+# Fetch remote qBitTorrent IP from config
+qbitip=$(xml sel -t -v "//alias[name=\"$qbitipalias\"]/address" $conffile)
+
 ###### Nextgen PIA port forwarding #######
 # If your connection is unstable you might need to adjust these.
 curl_max_time=15
 curl_retry=5
 curl_retry_delay=15
 
+
 get_auth_token () {
-  tok=$(curl --interface ${ovpniface} --insecure --silent --show-error --request POST --max-time $curl_max_time \
-    --header "Content-Type: application/json" \
-    --data "{\"username\":\"$piauser\",\"password\":\"$piapass\"}" \
-    "https://www.privateinternetaccess.com/api/client/v2/token" | jq -r '.token')
-  tok_rc=$?
-  if [ "$tok_rc" -ne 0 ]; then
-    logger "[PIA-API] Error! Failed to acquire auth token!"
-    exit 1
-  fi
+  tok=$(curl --interface $ovpniface --silent --show-error --request POST --max-time $curl_max_time \
+      --user "$piauser:$piapass" \
+      "https://www.privateinternetaccess.com/gtoken/generateToken" | jq -r '.token')
+  [ $? -ne 0 ] && logger "[PIA-API] Failed to acquire new auth token" && exit 1
+#  echo "$tok"
 }
+
 get_auth_token > /dev/null 2>&1
 
 bind_port () {
-  pf_bind=$(curl --interface ${ovpniface} --insecure --get --silent --show-error \
-    --retry $curl_retry --retry-delay $curl_retry_delay --max-time $curl_max_time \
-    --data-urlencode "payload=$pf_payload" \
-    --data-urlencode "signature=$pf_getsignature" \
-    "https://$pf_host:19999/bindPort")
-  if [ "$(echo "$pf_bind" | jq -r .status)" != "OK" ]; then
-    logger "[PIA-API] Error! Failed to bind received port!"
+  pf_bind=$(curl --interface $ovpniface --insecure --get --silent --show-error \
+      --retry $curl_retry --retry-delay $curl_retry_delay --max-time $curl_max_time \
+      --data-urlencode "payload=$pf_payload" \
+      --data-urlencode "signature=$pf_getsignature" \
+      "https://$pf_host:19999/bindPort")
+  if [ "$(echo $pf_bind | jq -r .status)" = "OK" ]; then
+    logger "[PIA-API] Reserved Port: $pf_port  $(date)"
+  else
+    logger "[PIA-API] $(date): bindPort error"
+    logger "[PIA-API] pf_bind"
+    logger "[PIA-API] the has been a fatal_error"
     exit 1
   fi
 }
 
+
 get_sig () {
-  pf_getsig=$(curl --interface ${ovpniface} --insecure --get --silent --show-error \
+  pf_getsig=$(curl --interface $ovpniface --insecure --get --silent --show-error \
     --retry $curl_retry --retry-delay $curl_retry_delay --max-time $curl_max_time \
     --data-urlencode "token=$tok" \
     "https://$pf_host:19999/getSignature")
-  if [ "$(echo "$pf_getsig" | jq -r .status)" != "OK" ]; then
-    logger "[PIA-API] Error! Failed to receive Signature!"
+  if [ "$(echo $pf_getsig | jq -r .status)" != "OK" ]; then
+    logger "[PIA-API] $(date): getSignature error"
+    logger "[PIA-API] $pf_getsig"
+    logger "[PIA-API] the has been a fatal_error"
     exit 1
   fi
   pf_payload=$(echo "$pf_getsig" | jq -r .payload)
@@ -85,6 +98,7 @@ get_sig () {
   pf_token_expiry=$(date -jf %Y-%m-%dT%H:%M:%S "$pf_token_expiry_raw" +%s)
 }
 
+
 # Rebind every 15 mins (same as desktop app)
 pf_bindinterval=$(( 15 * 60))
 
@@ -93,7 +107,7 @@ pf_bindinterval=$(( 15 * 60))
 pf_minreuse=$(( 60 * 60 * 24 * 7 ))
 
 pf_remaining=0
-vpn_ip=$(traceroute -i ${ovpniface} -m 1 privateinternetaccess.com | tail -n 1 | awk '{print $2}')
+vpn_ip=$(ifconfig | grep ${ovpniface} -2 | grep "inet 10" | awk '{print $4}')
 pf_host="$vpn_ip"
 log_cycle=0
 reloadcfg=0
@@ -157,6 +171,45 @@ while true; do
     /etc/rc.filter_configure
     logger "[PIA] New port $pf_port updated in pfSense config file."
   fi
+  
+  ###### Remote update of the qBitTorrent port #######
+  # Check if qBitTorrent host is reachable
+  ping -c1 -t1 -q "$qbitip" > /dev/null 2>&1
+  pingrc=$?
+  if [ "$pingrc" -gt 0 ]; then
+  if [ -z "${qhost_log+x}" ] || [ "$qhost_log" -eq 1 ]; then
+    logger "[qBit] Error! qBitTorrent host $qbitip is not reachable! Port update skipped. Won't log further failures till success."
+    qhost_log=0
+  fi
+  else
+  qhost_log=1
+  # Check if the qBitTorrent API service is running
+  curl --silent --connect-timeout 10 http://"$qbitip":8080/api/v2/app/preferences > /dev/null 2>&1
+  curlrc=$?
+  if [ "$curlrc" -gt 0 ]; then
+    if [ -z "${qrpc_log+x}" ] || [ "$qrpc_log" -eq 1 ]; then
+          logger "[qBit] Error! qBitTorrent service is NOT reachable on $qbitip. Check the service. Won't log further failures till success."
+          qrpc_log=0
+    fi
+  else
+    qrpc_log=1
+    # Update the qBitTorrent port
+    qbitcookie=$(curl -i -s -X POST -d "username=$qbituser&password=$qbitpass" http://${qbitip}:8080/api/v2/auth/login | awk '/^set-cookie:/ { print $2; exit }')
+    if [ -n "$qbitcookie" ]; then
+          getport=$(curl -s http://${qbitip}:8080/api/v2/app/preferences --cookie "$qbitcookie" | jq -c '.listen_port')
+          if [ "$getport" -ne "$pf_port" ]; then
+            setport=$(curl -s -i -d 'json={"listen_port": "'${pf_port}'"}' http://${qbitip}:8080/api/v2/app/setPreferences --cookie "$qbitcookie")
+            if [ -n "$setport" ]; then
+                  logger "[qBit] New port $pf_port successfully updated in remote qBitTorrent system."
+                  qport_log=1
+            elif [ -z "${qport_log+x}" ] || [ "$qport_log" -eq 1 ]; then
+                  logger "[qBit] Error! Failed to update the port. Response from API was: \"$setport\". Won't log further failures till success."
+                  qport_log=0
+            fi
+          fi
+    fi
+  fi
+  fi  
 
   ###### Remote update of the Transmisson port #######
   # Check if Transmission host is reachable
